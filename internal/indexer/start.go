@@ -10,20 +10,19 @@ import (
 	"github.com/anukul/flood-indexer/internal/types"
 )
 
-func (idx *Indexer) getPastOrders(fromBlock, toBlock uint64) ([]*types.Order, error) {
+func (idx *Indexer) getPastOrders(ordersChannel chan *types.Order, fromBlock, toBlock uint64) error {
 	pastOrderEvents, err := idx.getPastOrderEvents(fromBlock, toBlock, idx.cfg.RpcBatchSize)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var pastOrders []*types.Order
 	for _, orderEvent := range pastOrderEvents {
 		order, err := idx.getOrder(orderEvent)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		pastOrders = append(pastOrders, order)
+		ordersChannel <- order
 	}
-	return pastOrders, nil
+	return nil
 }
 
 func (idx *Indexer) getBlockBounds(entity string) (uint64, uint64, error) {
@@ -46,7 +45,7 @@ func (idx *Indexer) getBlockBounds(entity string) (uint64, uint64, error) {
 	return fromBlock, toBlock, nil
 }
 
-func (idx *Indexer) listenForNewOrders(ctx context.Context) error {
+func (idx *Indexer) listenForNewOrders(ctx context.Context, ordersChannel chan *types.Order) error {
 	slog.Info("listening for new order events")
 	orderEventChannel := make(chan *chain.FloodPlainL2OrderFulfilled)
 	subscription, err := idx.book.WatchOrderFulfilled(&bind.WatchOpts{}, orderEventChannel, nil, nil, nil)
@@ -66,12 +65,7 @@ func (idx *Indexer) listenForNewOrders(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if err := idx.db.InsertOrders([]*types.Order{order}); err != nil {
-				return err
-			}
-			if err := idx.db.SetLastIndexedBlock("orders", orderEvent.Raw.BlockNumber); err != nil {
-				return err
-			}
+			ordersChannel <- order
 		}
 	}
 }
@@ -86,15 +80,28 @@ func (idx *Indexer) Start(ctx context.Context) error {
 	if idx.cfg.Testing {
 		fromBlock, toBlock = uint64(112759760), uint64(112768387)
 	}
-	pastOrders, err := idx.getPastOrders(fromBlock, toBlock)
-	if err != nil {
-		return err
+	ordersChannel := make(chan *types.Order)
+	go func() {
+		if err := idx.getPastOrders(ordersChannel, fromBlock, toBlock); err != nil {
+			slog.Error(err.Error())
+			close(ordersChannel)
+			return
+		}
+	}()
+	go func() {
+		if err := idx.listenForNewOrders(ctx, ordersChannel); err != nil {
+			slog.Error(err.Error())
+			close(ordersChannel)
+			return
+		}
+	}()
+	for order := range ordersChannel {
+		if err := idx.db.InsertOrders([]*types.Order{order}); err != nil {
+			return err
+		}
+		if err := idx.db.SetLastIndexedBlock("orders", order.BlockNumber); err != nil {
+			return err
+		}
 	}
-	if err := idx.db.InsertOrders(pastOrders); err != nil {
-		return err
-	}
-	if err := idx.db.SetLastIndexedBlock("orders", toBlock); err != nil {
-		return err
-	}
-	return idx.listenForNewOrders(ctx)
+	return nil
 }
